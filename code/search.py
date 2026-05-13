@@ -3,6 +3,8 @@
 import pickle
 from pathlib import Path
 
+import json
+
 import numpy as np
 import faiss
 from openai import OpenAI
@@ -10,6 +12,7 @@ from openai import OpenAI
 from config import (
     OPENAI_API_KEY, EMBED_MODEL,
     INDEX_PATH, META_PKL,
+    CHAT_MODEL, SEARCH_RECALL_K
 )
 
 
@@ -29,78 +32,174 @@ with open(META_PKL, "rb") as f:
 print(f"   ✅ {_index.ntotal} 条向量,{len(_records)} 条元数据")
 
 
+### 下面是smart search的代码,目前还在测试阶段,接口可能会变动
+
 # ─────────────────────────────────────────────
-# 搜索函数
+# 查询解析(GPT 结构化输出)
 # ─────────────────────────────────────────────
 
-def embed_query(query: str) -> np.ndarray:
-    """把自然语言查询转成向量(归一化后)。"""
-    resp = client.embeddings.create(model=EMBED_MODEL, input=[query])
-    vec = np.array([resp.data[0].embedding], dtype=np.float32)
-    faiss.normalize_L2(vec)
-    return vec
+PARSE_PROMPT = """You are a danbooru tag expert. Parse the user's query into a structured filter.
 
+# Output format
+You MUST output valid JSON:
+{
+  "positive": {
+    "general":   [list of general/concept tags],
+    "character": [list of character tags],
+    "copyright": [list of copyright/series tags]
+  },
+  "negative": {
+    "general":   [...],
+    "character": [...],
+    "copyright": [...]
+  },
+  "semantic": "free-text description"
+}
 
-from config import CHAT_MODEL   # config 里加 CHAT_MODEL = "gpt-4o-mini"
+# Tag categorization
+- character: specific character names (hatsune_miku, kagamine_rin, ...)
+- copyright: series/franchise names (vocaloid, blue_archive, genshin_impact, ...)
+- general: everything else (1girl, from_behind, pink_hair, dragon_girl, smile, ...)
 
+# Rules
+1. All tags lowercase, underscores for multi-word
+2. NEVER invent fake tags (no_xxx, etc.)
+3. Interpret intent:
+   - "要 X" / "want X" → positive
+   - "不要 X" / "no X" → negative
+   - Ambiguous → prefer positive
+4. If a category has no tags, use empty list []
 
-REWRITE_PROMPT = """You are a danbooru tag expert. Convert the user's natural language query into danbooru tags.
+# Examples
+User: 粉色头发的龙娘,从背后看
+Output: {"positive": {"general": ["1girl", "dragon_girl", "pink_hair", "from_behind"], "character": [], "copyright": []}, "negative": {"general": [], "character": [], "copyright": []}, "semantic": "dragon girl with pink hair from behind"}
 
-Rules:
-- Output ONLY the tags, separated by spaces, no other text
-- Use underscores for multi-word tags (e.g., "from_behind" not "from behind")
-- Use lowercase
-- Common tag patterns:
-  - person count: 1girl, 1boy, 2girls, ...
-  - viewpoint: from_behind, from_above, from_side, looking_back
-  - hair: pink_hair, long_hair, short_hair, twintails
-  - fantasy: dragon_girl, monster_girl, kemonomimi
-  - composition: solo, multiple_girls
+User: 初音未来穿校服
+Output: {"positive": {"general": ["1girl", "school_uniform"], "character": ["hatsune_miku"], "copyright": ["vocaloid"]}, "negative": {"general": [], "character": [], "copyright": []}, "semantic": "Hatsune Miku wearing school uniform"}
 
-Examples:
-User: a girl with pink hair seen from behind
-Output: 1girl pink_hair from_behind
+User: 龙娘,异色皮肤
+Output: {"positive": {"general": ["1girl", "dragon_girl", "colored_skin"], "character": [], "copyright": []}, "negative": {"general": [], "character": [], "copyright": []}, "semantic": "dragon girl with colored skin"}
 
-User: 龙娘从背后看
-Output: 1girl dragon_girl from_behind
+User: 龙娘,不要异色皮肤
+Output: {"positive": {"general": ["1girl", "dragon_girl"], "character": [], "copyright": []}, "negative": {"general": ["colored_skin", "multicolored_skin"], "character": [], "copyright": []}, "semantic": "dragon girl with normal skin"}
 
-User: two girls smiling
-Output: 2girls smile
+User: blue archive characters, not miku
+Output: {"positive": {"general": [], "character": [], "copyright": ["blue_archive"]}, "negative": {"general": [], "character": ["hatsune_miku"], "copyright": []}, "semantic": "Blue Archive characters"}
 
-Now convert this query:
+Now parse:
 """
 
-
-def rewrite_query(natural_query: str) -> str:
-    """把自然语言转成 tag 串。"""
+def parse_query(natural_query: str) -> dict:
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
-            {"role": "system", "content": REWRITE_PROMPT},
+            {"role": "system", "content": PARSE_PROMPT},
             {"role": "user",   "content": natural_query},
         ],
-        temperature=0,    # 关闭随机性
+        temperature=0,
+        response_format={"type": "json_object"},
     )
-    return resp.choices[0].message.content.strip()
+    
+    try:
+        parsed = json.loads(resp.choices[0].message.content)
+    except json.JSONDecodeError as e:
+        print(f"⚠️ GPT 输出 JSON 解析失败: {e}")
+        parsed = {}
+    
+    # 兜底:确保结构完整
+    def get_category(d, key):
+        sub = d.get(key) or {}
+        return {
+            "general":   sub.get("general")   or [],
+            "character": sub.get("character") or [],
+            "copyright": sub.get("copyright") or [],
+        }
+    
+    return {
+        "positive": get_category(parsed, "positive"),
+        "negative": get_category(parsed, "negative"),
+        "semantic": parsed.get("semantic") or natural_query,
+    }
 
 
-def search(query: str, top_k: int = 5, use_rewrite: bool = True) -> list[dict]:
-    """搜索。use_rewrite=True 时先用 GPT 改写查询。"""
-    if use_rewrite:
-        rewritten = rewrite_query(query)
-        print(f"  🔄 改写: '{query}' → '{rewritten}'")
-        embed_input = rewritten
-    else:
-        embed_input = query
+# ─────────────────────────────────────────────
+# Smart Search:解析 + 召回 + 过滤
+# ─────────────────────────────────────────────
+
+def smart_search(
+    query: str,
+    top_k: int = 5,
+    recall_k: int = SEARCH_RECALL_K,
+    verbose: bool = True,
+) -> list[dict]:
+    parsed = parse_query(query)
+    pos = parsed["positive"]
+    neg = parsed["negative"]
+    semantic = parsed["semantic"]
     
-    q_vec = embed_query(embed_input)
+    if verbose:
+        print(f"🔍 查询: \"{query}\"")
+        print(f"   ✅ positive:")
+        print(f"      general:   {pos['general']}")
+        print(f"      character: {pos['character']}")
+        print(f"      copyright: {pos['copyright']}")
+        print(f"   ❌ negative:")
+        print(f"      general:   {neg['general']}")
+        print(f"      character: {neg['character']}")
+        print(f"      copyright: {neg['copyright']}")
+        print(f"   📝 semantic: {semantic}\n")
     
-    scores, indices = _index.search(q_vec, top_k)
+    # ── embedding 召回 ──
+    # 把所有 positive tag 拍平拼成文本
+    all_positive = pos["general"] + pos["character"] + pos["copyright"]
+    embed_text = " ".join(all_positive) + ". " + semantic
+    q_vec = embed_query(embed_text)
     
+    scores, indices = _index.search(q_vec, recall_k)
+    
+    # ── 分类别硬过滤 ──
     results = []
-    for rank, (idx, score) in enumerate(zip(indices[0], scores[0]), start=1):
-        meta = _records[idx].copy()
-        meta["_rank"]  = rank
-        meta["_score"] = float(score)
-        results.append(meta)
+    stats = {"total": 0, "miss_pos": 0, "hit_neg": 0}
+    
+    for idx, score in zip(indices[0], scores[0]):
+        stats["total"] += 1
+        meta = _records[idx]
+        
+        # 三个字段分别建 set
+        general_set   = set((meta.get("tag_string_general")   or "").split())
+        character_set = set((meta.get("tag_string_character") or "").split())
+        copyright_set = set((meta.get("tag_string_copyright") or "").split())
+        
+        # 必须包含所有 positive(分别在对应字段)
+        if not (
+            all(t in general_set   for t in pos["general"]) and
+            all(t in character_set for t in pos["character"]) and
+            all(t in copyright_set for t in pos["copyright"])
+        ):
+            stats["miss_pos"] += 1
+            continue
+        
+        # 不能包含任何 negative
+        if (
+            any(t in general_set   for t in neg["general"]) or
+            any(t in character_set for t in neg["character"]) or
+            any(t in copyright_set for t in neg["copyright"])
+        ):
+            stats["hit_neg"] += 1
+            continue
+        
+        result = meta.copy()
+        result["_rank"] = len(results) + 1
+        result["_score"] = float(score)
+        results.append(result)
+        
+        if len(results) >= top_k:
+            break
+    
+    if verbose:
+        print(f"📊 召回 {stats['total']} 张候选")
+        print(f"   - 缺少 positive 被过滤: {stats['miss_pos']}")
+        print(f"   - 命中 negative 被过滤: {stats['hit_neg']}")
+        print(f"   - 最终返回: {len(results)} 张\n")
+    
     return results

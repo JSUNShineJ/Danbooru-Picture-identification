@@ -4,6 +4,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# 召回阶段拿多少候选(留余量给后续过滤)
+SEARCH_RECALL_K = 1000
+
 # ── 路径 ──────────────────────────────
 BASE_DIR   = Path(__file__).parent       # 项目根目录
 DATA_DIR   = BASE_DIR / "data"
