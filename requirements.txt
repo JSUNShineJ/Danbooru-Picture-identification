@@ -1,0 +1,16 @@
+# Core crawler/index/search
+requests
+python-dotenv
+openai
+faiss-cpu
+numpy
+
+# Notebook demo
+ipython
+jupyter
+
+# WD14 tagger / experimental
+pandas
+Pillow
+onnxruntime
+huggingface-hub
