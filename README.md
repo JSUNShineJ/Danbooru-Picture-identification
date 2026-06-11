@@ -50,11 +50,15 @@ A GPT model will happily invent tags that don't exist in the Danbooru vocabulary
 │   ├── search_new.py               # smart / simple / wd14-only search
 │   ├── config.py                   # settings (read API keys from env)
 │   ├── run_wd14_batch.py           # batch WD14 inference over the corpus
-│   ├── WD14-threshold-test.py      # threshold sweep experiment
 │   ├── Build wiki db index.py      # builds the Danbooru wiki grounding index
-│   ├── metadata_with_wd14.jsonl    # WD14 tagging output (cached)
-│   ├── wd14_pr_curve.png           # precision/recall curve from the sweep
+│   ├── tagger.py                   # tag pictures with WD14
+│   ├── tag_resolver.py             # RAG systerm built to gain real tag output
 │   └── searchresult.ipynb          # run queries + view results inline
+├── data/
+│   ├── metadata_with_wd14.jsonl    # WD14 tagging output (cached)
+├── WD14_threshold_test/
+│   ├── WD14-threshold-test.py      # threshold sweep experiment
+│   ├── wd14_pr_curve.png           # precision/recall curve from the sweep
 ├── upcomingfeacher/                # work-in-progress features
 ├── requirements.txt
 └── README.md
