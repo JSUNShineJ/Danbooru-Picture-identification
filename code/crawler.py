@@ -110,18 +110,7 @@ def download_image(url: str, save_path: Path) -> bool:
     except Exception as e:
         print(f"  ⚠️ 下载失败: {url} ({e})")
         return False
-    """下载一张图。成功返回 True。"""
-    try:
-        resp = requests.get(url, headers=headers, timeout=30, stream=True)
-        resp.raise_for_status()
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(save_path, "wb") as f:
-            for chunk in resp.iter_content(8192):
-                f.write(chunk)
-        return True
-    except Exception as e:
-        print(f"  ⚠️ 下载失败: {url} ({e})")
-        return False
+   
 
 
 # ─────────────────────────────────────────────
@@ -237,5 +226,4 @@ def crawl_all():
 
 
 if __name__ == "__main__":
-    crawl_all()
     crawl_all()
